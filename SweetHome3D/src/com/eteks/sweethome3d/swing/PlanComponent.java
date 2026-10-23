@@ -82,6 +82,7 @@ import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.InvocationTargetException;
 import java.net.URL;
 import java.security.AccessControlException;
 import java.text.Format;
@@ -2004,11 +2005,13 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
   }
   
   /**
-   * Prints this component plan at the scale given in the home print attributes or at a scale 
+   * Prints this component plan at the scale given in the home print attributes or at a scale
    * that makes it fill <code>pageFormat</code> imageable size if this attribute is <code>null</code>.
+   * Each viewable level gets its own pages, in home level order, with the same scale and framing
+   * for every level. The home's selected level and selected items are restored before this method returns.
    */
   public int print(Graphics g, PageFormat pageFormat, int pageIndex) {
-    List<Selectable> printedItems = getPaintedItems(); 
+    List<Selectable> printedItems = getPaintedItems();
     Rectangle2D printedItemBounds = getItemsBounds(g, printedItems);
     if (printedItemBounds != null) {
       double imageableX = pageFormat.getImageableX();
@@ -2016,20 +2019,13 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
       double imageableWidth = pageFormat.getImageableWidth();
       double imageableHeight = pageFormat.getImageableHeight();
       float printScale;
-      float rowIndex;
-      float columnIndex;
       int pagesPerRow;
       int pagesPerColumn;
       if (this.home.getPrint() == null || this.home.getPrint().getPlanScale() == null) {
         // Compute a scale that ensures the plan will fill the component if plan scale is null
         printScale = getPrintPreferredScale(g, pageFormat) * LengthUnit.centimeterToInch(72);
-        if (pageIndex > 0) {
-          return NO_SUCH_PAGE;
-        }
         pagesPerRow = 1;
         pagesPerColumn = 1;
-        rowIndex   = 0;
-        columnIndex = 0;
       } else {
         // Apply print scale to paper size expressed in 1/72nds of an inch
         printScale = this.home.getPrint().getPlanScale().floatValue() * LengthUnit.centimeterToInch(72);
@@ -2041,13 +2037,17 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
         if (printedItemBounds.getHeight() * printScale != imageableHeight) {
           pagesPerColumn++;
         }
-        if (pageIndex >= pagesPerRow * pagesPerColumn) {
-          return NO_SUCH_PAGE;
-        }
-        rowIndex = pageIndex / pagesPerRow;
-        columnIndex = pageIndex - rowIndex * pagesPerRow;
       }
-          
+      int pagesPerLevel = pagesPerRow * pagesPerColumn;
+      List<Level> printedLevels = getPrintedLevels();
+      if (pageIndex >= pagesPerLevel * printedLevels.size()) {
+        return NO_SUCH_PAGE;
+      }
+      Level printedLevel = printedLevels.get(pageIndex / pagesPerLevel);
+      int levelPageIndex = pageIndex % pagesPerLevel;
+      float rowIndex = levelPageIndex / pagesPerRow;
+      float columnIndex = levelPageIndex - rowIndex * pagesPerRow;
+
       Graphics2D g2D = (Graphics2D)g.create();
       g2D.clip(new Rectangle2D.Double(imageableX, imageableY, imageableWidth, imageableHeight));
       // Change coordinates system to paper imageable origin
@@ -2063,18 +2063,76 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
               (imageableHeight * pagesPerColumn / printScale - printedItemBounds.getHeight() - 2 * extraMargin) / 2));
       setRenderingHints(g2D);
       try {
-        // Print component contents
-        paintContent(g2D, printScale, PaintMode.PRINT);
-      } catch (InterruptedIOException ex) {
-        // Ignore exception because it may happen only in EXPORT paint mode 
-      }   
-      g2D.dispose();
+        printLevel(g2D, printScale, printedLevel);
+      } finally {
+        g2D.dispose();
+      }
       return PAGE_EXISTS;
     } else {
       return NO_SUCH_PAGE;
     }
   }
-  
+
+  /**
+   * Paints the plan of <code>printedLevel</code> in <code>g2D</code>.
+   * Plan painting draws the selected level, so the printed level is selected only while it's painted.
+   * Home listeners expect to run in Event Dispatch Thread and drop selected items that aren't
+   * at a newly selected level, so this happens in Event Dispatch Thread and the previous
+   * selected level and selected items are restored afterwards.
+   */
+  private void printLevel(final Graphics2D g2D, final float printScale, final Level printedLevel) {
+    if (!EventQueue.isDispatchThread()) {
+      try {
+        EventQueue.invokeAndWait(new Runnable() {
+            public void run() {
+              printLevel(g2D, printScale, printedLevel);
+            }
+          });
+      } catch (InterruptedException ex) {
+        Thread.currentThread().interrupt();
+      } catch (InvocationTargetException ex) {
+        if (ex.getCause() instanceof RuntimeException) {
+          throw (RuntimeException)ex.getCause();
+        } else if (ex.getCause() instanceof Error) {
+          throw (Error)ex.getCause();
+        }
+        throw new RuntimeException(ex.getCause());
+      }
+      return;
+    }
+
+    Level selectedLevel = this.home.getSelectedLevel();
+    List<Selectable> selectedItems = new ArrayList<Selectable>(this.home.getSelectedItems());
+    try {
+      this.home.setSelectedLevel(printedLevel);
+      paintContent(g2D, printScale, PaintMode.PRINT);
+    } catch (InterruptedIOException ex) {
+      // Ignore exception because it may happen only in EXPORT paint mode
+    } finally {
+      if (printedLevel != selectedLevel) {
+        this.home.setSelectedLevel(selectedLevel);
+        this.home.setSelectedItems(selectedItems);
+      }
+    }
+  }
+
+  /**
+   * Returns the levels whose plan is printed, that is the viewable levels in home order,
+   * or only the selected level, possibly <code>null</code>, if the home has no viewable level.
+   */
+  private List<Level> getPrintedLevels() {
+    List<Level> viewableLevels = new ArrayList<Level>();
+    for (Level level : this.home.getLevels()) {
+      if (level.isViewable()) {
+        viewableLevels.add(level);
+      }
+    }
+    if (viewableLevels.isEmpty()) {
+      return Collections.singletonList(this.home.getSelectedLevel());
+    }
+    return viewableLevels;
+  }
+
   /**
    * Returns an image of the selected items displayed by this component 
    * (camera excepted) with no outline at scale 1/1 (1 pixel = 1cm).
